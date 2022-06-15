@@ -488,8 +488,8 @@ class TestIpaHealthCheck(IntegrationTest):
         This testcase checks that when the pki-tomcat service is stopped,
         DogtagCertsConnectivityCheck displays the result as ERROR.
         """
-        error_msg = (
-            "Request for certificate failed, "
+        error_msg = "Request for certificate failed"
+        additional_msg = (
             "Certificate operation cannot be completed: "
             "Request failed with status 503: "
             "Non-2xx response from CA REST API: 503.  (503)"
@@ -501,7 +501,11 @@ class TestIpaHealthCheck(IntegrationTest):
         assert returncode == 1
         for check in data:
             assert check["result"] == "ERROR"
-            assert check["kw"]["msg"] == error_msg
+            assert error_msg in check["kw"]["msg"]
+            # pre ipa-healthcheck 0.11, the additional msg was in msg
+            # but moved to "error" with 0.11+
+            assert additional_msg in check["kw"]["msg"] or \
+                   additional_msg == check["kw"]["error"]
 
     def test_source_ipahealthcheck_meta_core_metacheck(self):
         """
@@ -1290,6 +1294,23 @@ class TestIpaHealthCheck(IntegrationTest):
         )
         assert msg in cmd.stdout_text
 
+    def modify_perms_run_healthcheck(self, filename, modify_permissions,
+                                     expected_permissions):
+        """
+        Modify the ipa logfile permissions and run
+        healthcheck command to check the status.
+        """
+        modify_permissions(self.master, path=filename, mode="0644")
+        returncode, data = run_healthcheck(
+            self.master, "ipahealthcheck.ipa.files", failures_only=True
+        )
+        assert returncode == 1
+        assert len(data) == 1
+        assert data[0]["result"] == "WARNING"
+        assert data[0]["kw"]["path"] == filename
+        assert data[0]["kw"]["type"] == "mode"
+        assert data[0]["kw"]["expected"] == expected_permissions
+
     def test_ipahealthcheck_verify_perms_for_source_files(self,
                                                           modify_permissions):
         """
@@ -1297,21 +1318,26 @@ class TestIpaHealthCheck(IntegrationTest):
         source.
         The test modifies permissions of ipainstall log file and checks the
         response from healthcheck.
-
         https://pagure.io/freeipa/issue/8949
         """
-        modify_permissions(self.master, path=paths.IPASERVER_INSTALL_LOG,
-                           mode="0644")
-        returncode, data = run_healthcheck(
-            self.master, "ipahealthcheck.ipa.files", failures_only=True)
+        self.modify_perms_run_healthcheck(
+            paths.IPASERVER_INSTALL_LOG, modify_permissions,
+            expected_permissions="0600"
+        )
 
-        assert returncode == 1
-        assert len(data) == 1
-        assert data[0]["result"] == "WARNING"
-        assert data[0]["kw"]["path"] == paths.IPASERVER_INSTALL_LOG
-        assert data[0]["kw"]["type"] == "mode"
-        assert data[0]["kw"]["expected"] == "0600"
-
+    def test_ipahealthcheck_verify_perms_upgrade_log_file(self,
+                                                          modify_permissions):
+        """
+        This testcase creates /var/log/ipaupgrade.log file.
+        Once the file is generated the permissions are modified
+        to check that correct status message is displayed
+        by healthcheck tool
+        """
+        self.master.run_command(["touch", paths.IPAUPGRADE_LOG])
+        self.modify_perms_run_healthcheck(
+            paths.IPAUPGRADE_LOG, modify_permissions,
+            expected_permissions="0600"
+        )
 
     @pytest.fixture
     def remove_healthcheck(self):
@@ -2791,6 +2817,11 @@ class TestIpaHealthCheckWithExternalCA(IntegrationTest):
         error_reason = (
             "RA agent description does not match"
         )
+        ldap = self.master.ldap_connect()
+        dn = DN(("uid", "ipara"), ("ou", "People"), ("o", "ipaca"))
+        entry = ldap.get_entry(dn)
+        ldap_cert_desc = entry.single_value.get("description")
+
         update_ra_cert_desc(
             '2;16;CN=Certificate Authority,O=%s;CN=IPA RA,O=%s' %
             (self.master.domain.realm, self.master.domain.realm)
@@ -2804,9 +2835,7 @@ class TestIpaHealthCheckWithExternalCA(IntegrationTest):
         for check in data:
             assert check["result"] == "ERROR"
             assert (
-                check["kw"]["expected"] == "2;6;"
-                "CN=Certificate Authority,O=%s;CN=IPA RA,"
-                "O=%s" % (self.master.domain.realm, self.master.domain.realm)
+                check["kw"]["expected"] == ldap_cert_desc
             )
             assert (
                 check["kw"]["got"] == "2;16;"
